@@ -441,11 +441,54 @@ class SQAIR(nn.Module):
         self.propagate_prior = PropagatePrior()
         
         
-        # Initial relation, temporal, relation, object state
+        # Embedding layer
+        self.embedding = Embedding()
         
         
     def forward(self, x):
-        pass
+        """
+        Args:
+            x: image sequence of shape (T, B, 1, H, W)
+
+        Returns:
+
+        """
+        
+        B = x.size(1)
+        
+        kl = 0.0
+        # Image reconstructed for each time step
+        recons_list = []
+        
+        for t in arch.T:
+            # Enter time step t
+            # (B, 1, H, W)
+            image = x[t]
+            # Compute embedding for this image (B, N)
+            image_embed = self.embedding(x)
+            # Initialize relation state
+            state_rel = RelationState.get_initial_state(B)
+            
+            # Propagate.
+            # Note we do not  propagate for the first time step.
+            if t != 0:
+                # Do propagate
+                pass
+            
+            # Discover
+            # temporal state list
+            state_tem_list = []
+            for k in range(arch.K):
+                # One step of discover
+                state_tem, state_rel, state_prior, kl, z_pres_likelihood = (
+                    self.discover(image, image_embed, state_rel))
+            
+            
+            
+            
+            
+            
+        
     
     def propagate(self, x, x_embed, prev_relation, prev_temporal, prev_prior):
         """
