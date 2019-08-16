@@ -298,6 +298,30 @@ class Encoder(nn.Module):
         z_what_scale = F.softplus(z_what_scale)
         
         return z_what_loc, z_what_scale
+    
+class Decoder(nn.Module):
+    """
+    Decoder z_what into glimpse.
+    """
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.fc1 = nn.Linear(arch.z_what_size, arch.decoder_hidden_size)
+        self.fc2 = nn.Linear(arch.decoder_hidden_size, arch.glimpse_size)
+        
+    def forward(self, z_what):
+        """
+        Args:
+            z_what: (B, N)
+
+        Returns:
+            glimpse: (B, 1, H, W)
+        """
+        B = z_what.size(0)
+        x = self.fc2(F.elu(self.fc1(z_what)))
+        x = F.sigmoid(x)
+        x = x.view(B, 1, *arch.glimpse_shape)
+        
+        return x
 
 
 class PropagatePrior(nn.Module):
@@ -443,6 +467,7 @@ class SQAIR(nn.Module):
         
         # Encode glimpse into z_what parameters
         self.encoder = Encoder()
+        self.decoder = Decoder()
 
         # This is a module, computing current prior parameters from previous
         # priors (encoded in LSTM)
@@ -463,14 +488,17 @@ class SQAIR(nn.Module):
             x: image sequence of shape (T, B, 1, H, W)
 
         Returns:
-
+            elbo: (B,) ELBO
+            z_pres_likelihood_total: (B,), likelihood sum for z_pres
         """
         
         B = x.size(1)
         
+        # (B,)
         kl_total = 0.0
         z_pres_likelihood_total = 0.0
         self.highest_id = torch.zeros(B, 1, device=x.device)
+        # (B,)
         likelihood_total = 0.0
         
         for t in arch.T:
@@ -516,6 +544,17 @@ class SQAIR(nn.Module):
             # Note that though not so elegant, objects will also be kept in state_tem_list.
             state_tem_list_prev = self.rearrange(state_tem_list)
             
+            # Extract object list
+            object_list = [state.object for state in state_tem_list_prev]
+            # Reconstruct and compute likelihood
+            recons, ll = self.reconstruct(object_list, image)
+            likelihood_total += ll
+            
+            
+        elbo = likelihood_total - kl_total
+        
+        return elbo, z_pres_likelihood_total
+            
             
             
         
@@ -537,8 +576,8 @@ class SQAIR(nn.Module):
         Returns:
             temporal_state: TemporalState
             relation_state:  RelationState
-            kl: kl divergence for all z's. Scalar
-            z_pres_likelihood: q(z_pres|x). Scalar
+            kl: kl divergence for all z's. (B, 1)
+            z_pres_likelihood: q(z_pres|x). (B, 1)
         """
         
         # First, encode relation and temporal info to get current h^{T, i}_t and
@@ -630,8 +669,6 @@ class SQAIR(nn.Module):
         temporal_state = TemporalState(object_state, h_tem, c_tem)
         relation_state = RelationState(object_state, h_rel, c_rel)
         
-        kl = kl.mean()
-        z_pres_likelihood = z_pres_likelihood.mean()
         return temporal_state, relation_state, kl, z_pres_likelihood
 
     def discover(self, x, x_embed, prev_relation):
@@ -653,8 +690,8 @@ class SQAIR(nn.Module):
         Returns:
             temporal_state: TemporalState
             relation_state:  RelationState
-            kl: kl divergence for all z's. Scalar
-            z_pres_likelihood: q(z_pres|x). Scalar
+            kl: kl divergence for all z's. (B,)
+            z_pres_likelihood: q(z_pres|x). (B,)
         """
         # First, encode relation info to get current h^{R, i}_t
         # Each being (B, N)
@@ -739,10 +776,6 @@ class SQAIR(nn.Module):
         relation_state = RelationState(object_state, h_rel, c_rel)
 
 
-        # Mean over batch
-        kl = kl.mean()
-        z_pres_likelihood = z_pres_likelihood.mean()
-        
         return temporal_state, relation_state, kl, z_pres_likelihood
     
     def rearrange(self, temporal_states):
@@ -796,4 +829,40 @@ class SQAIR(nn.Module):
             new_states.append(new_state)
             
         return new_states
+    
+    def reconstruct(self, object_list, img):
+        """
+        Do reconstruction and compute likelihood.
         
+        Args:
+            object_list: a list of ObjectState of length K.
+            img: original image of shape (B, 1, H, W)
+
+        Returns:
+            recons: reconstructed image. (B, 1, H, W)
+            likelihood: (B,)
+        """
+        
+        B = img.size(0)
+        canvas = torch.zeros_like(img)
+        
+        for obj in object_list:
+            # Decode to (B, 1, H, W)
+            glimpse = self.decoder(obj.z_what)
+            # Transform to image size
+            recons = self.glimpse_to_image(glimpse, inverse=False)
+            
+            # (B, 1, 1, 1)
+            mask = obj.z_pres[:,:,None,None]
+            canvas = canvas + mask * recons
+            
+        # Construct output distribution
+        output_dist = Normal(canvas, arch.x_scale.expand(canvas.size()))
+        
+        # Likelihood
+        likelihood = output_dist.log_prob(img)
+        likelihood = likelihood.view(B, -1).sum(1)
+        
+        return canvas, likelihood
+            
+            

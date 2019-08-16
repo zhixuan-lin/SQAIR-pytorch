@@ -50,7 +50,7 @@ class SequentialMNIST(Dataset):
         """
         
         # (T, H, W)
-        imgs = self.imgs[index]
+        imgs = self.imgs[:, index]
         T = imgs.size(0)
         # (T, 1, C, H, W)
         imgs = imgs[:, None, None]
@@ -60,6 +60,10 @@ class SequentialMNIST(Dataset):
         nums = nums.expand(T, 1)
         
         return imgs, nums
+    
+    def __len__(self):
+        return self.imgs.size(1)
+    
     
 def collate_fn(samples):
     """

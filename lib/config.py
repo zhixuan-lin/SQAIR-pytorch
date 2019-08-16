@@ -1,5 +1,5 @@
 from attrdict import AttrDict
-
+import os
 
 cfg = AttrDict({
     # 'exp_name': 'test',
@@ -11,7 +11,7 @@ cfg = AttrDict({
     # 'exp_name': 'test_05',
     # 'exp_name': 'noreinforce',
     'resume': True,
-    'device': 'cuda:0',
+    'device': 'cpu',
     'train': {
         'batch_size': 64,
         'model_lr': 1e-4,
