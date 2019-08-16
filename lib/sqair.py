@@ -7,6 +7,7 @@ from torch.distributions.bernoulli import Bernoulli
 from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
 from .config import cfg
+from collections import defaultdict
 
 
 # default sqair architecture. This is global for convenience
@@ -65,18 +66,20 @@ class ObjectState(AttrDict):
     This is 'z' in the paper, including presence, where and what.
     """
     
-    def __init__(self, z_pres, z_where, z_what):
+    def __init__(self, z_pres, z_where, z_what, id):
         """
         Args:
             z_pres:  (B, 1)
             z_where: (B, 4)
             z_what: (B, N)
+            id: (B, 1). 0 for empty slots.
         """
         AttrDict.__init__(
             self,
             z_pres=z_pres,
             z_where=z_where,
             z_what=z_what,
+            id=id
         )
     
     def get_encoding(self):
@@ -94,6 +97,7 @@ class ObjectState(AttrDict):
             z_pres=torch.ones(B, 1, device=cfg.device),
             z_where=torch.zeros(B, 4, device=cfg.device),
             z_what=torch.zeros(B, arch.z_what_size, device=cfg.device),
+            id = torch.zeros(B, 1, device=cfg.device)
         )
 
     
@@ -137,6 +141,10 @@ class TemporalState(AttrDict):
     def __init__(self, object_state, h, c):
         AttrDict.__init__(self, h=h, c=c)
         self.object_state = object_state
+        
+    def __getattr__(self, item):
+        if item not in self.__dict__:
+            return getattr(self.object_state, item)
 
     @staticmethod
     def get_initial_state(batch_size, object_state):
@@ -300,7 +308,7 @@ class PropagatePrior(nn.Module):
     
     def __init__(self):
         nn.Module.__init__(self)
-        self.fc1 = nn.Linear(arch.rnn_prior_hidden_size,
+        self.fc1 = nn.Linear(arch.rnn_temporal_hidden_size,
                              arch.prior_hidden_size)
         self.fc2 = nn.Linear(arch.prior_hidden_size, 2 * arch.z_what_size + 4 * 2 + 1)
     
@@ -422,8 +430,8 @@ class SQAIR(nn.Module):
                                         arch.rnn_temporal_hidden_size)
         
         # Prior RNN
-        self.rnn_prior = nn.LSTMCell(ObjectState.get_size(),
-                                     arch.rnn_prior_hidden_size)
+        # self.rnn_prior = nn.LSTMCell(ObjectState.get_size(),
+        #                              arch.rnn_prior_hidden_size)
         
         # Predict z_pres, z_where given h^T, h^T, x
         self.propagate_predict = PropagatePredict()
@@ -445,6 +453,10 @@ class SQAIR(nn.Module):
         self.embedding = Embedding()
         
         
+        # Per-batch current highest id. Shape (B, 1). Initialized later.
+        self.highest_id = None
+        
+        
     def forward(self, x):
         """
         Args:
@@ -456,41 +468,59 @@ class SQAIR(nn.Module):
         
         B = x.size(1)
         
-        kl = 0.0
-        # Image reconstructed for each time step
-        recons_list = []
+        kl_total = 0.0
+        z_pres_likelihood_total = 0.0
+        self.highest_id = torch.zeros(B, 1, device=x.device)
+        likelihood_total = 0.0
         
         for t in arch.T:
             # Enter time step t
             # (B, 1, H, W)
             image = x[t]
             # Compute embedding for this image (B, N)
-            image_embed = self.embedding(x)
-            # Initialize relation state
+            image_embed = self.embedding(image)
+            
+            
+            # Initialization
             state_rel = RelationState.get_initial_state(B)
+            state_tem_list = []
             
             # Propagate.
             # Note we do not  propagate for the first time step.
             if t != 0:
                 # Do propagate
-                pass
-            
+                for k in range(arch.K):
+                    state_tem = state_tem_list_prev[k]
+                    state_tem, state_rel, kl, z_pres_likelihood = (
+                        self.propagate(image, image_embed, state_rel, state_tem))
+                    
+                    state_tem_list.append(state_tem)
+                    kl_total += kl
+                    z_pres_likelihood_total += z_pres_likelihood
+
             # Discover
-            # temporal state list
-            state_tem_list = []
             for k in range(arch.K):
                 # One step of discover
-                state_tem, state_rel, state_prior, kl, z_pres_likelihood = (
+                state_tem, state_rel, kl, z_pres_likelihood = (
                     self.discover(image, image_embed, state_rel))
-            
-            
-            
+                
+                # Record temporal states
+                state_tem_list.append(state_tem)
+                # Record losses
+                kl_total += kl
+                z_pres_likelihood_total += z_pres_likelihood
+                
+            # Temporal state
+            # This will be of length K (for first step) or 2K. Each item is a
+            # temporal state.
+            # Note that though not so elegant, objects will also be kept in state_tem_list.
+            state_tem_list_prev = self.rearrange(state_tem_list)
             
             
             
         
     
-    def propagate(self, x, x_embed, prev_relation, prev_temporal, prev_prior):
+    def propagate(self, x, x_embed, prev_relation, prev_temporal):
         """
         Propagate step for a single object in a single time step.
         
@@ -503,12 +533,10 @@ class SQAIR(nn.Module):
             x_embed: extracted image feature. Size (B, N)
             prev_relation: see RelationState
             prev_temporal: see TemporalState
-            prev_prior: see PriorState
             
         Returns:
             temporal_state: TemporalState
             relation_state:  RelationState
-            prior_state: PropagatePriorState
             kl: kl divergence for all z's. Scalar
             z_pres_likelihood: q(z_pres|x). Scalar
         """
@@ -556,14 +584,11 @@ class SQAIR(nn.Module):
         # will need to compute the recursive prior. This is parametrized by
         # previous object state (z) and hidden states from LSTM.
         
-        # Compute current state
-        h_prior, c_prior = self.rnn_prior(prev_prior.object.get_encoding(),
-                                          (prev_prior.h, prev_prior.c))
         
         # Compute prior for current step
         (z_what_loc_prior, z_what_scale_prior, z_where_loc_prior,
             z_where_scale_prior, z_pres_prob_prior) = (
-            self.propagate_prior(h_prior))
+            self.propagate_prior(h_tem))
         
         # Construct prior distributions
         z_what_prior = Normal(z_what_loc_prior, z_what_scale_prior)
@@ -596,15 +621,18 @@ class SQAIR(nn.Module):
         # on model parameter. (B, 1) here
         z_pres_likelihood = z_pres_likelihood * prev_temporal.object.z_pres.sum(-1)
         
+        # Compute id. If z_pres is 1, then inherit that id. Otherwise set it to
+        # zero
+        id = prev_temporal.object.id * z_pres
+        
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what)
+        object_state = ObjectState(z_pres, z_where, z_what, id)
         temporal_state = TemporalState(object_state, h_tem, c_tem)
         relation_state = RelationState(object_state, h_rel, c_rel)
-        prior_state = PropagatePriorState(object_state, h_prior, c_prior)
         
         kl = kl.mean()
         z_pres_likelihood = z_pres_likelihood.mean()
-        return temporal_state, relation_state, prior_state, kl, z_pres_likelihood
+        return temporal_state, relation_state, kl, z_pres_likelihood
 
     def discover(self, x, x_embed, prev_relation):
         """
@@ -625,7 +653,6 @@ class SQAIR(nn.Module):
         Returns:
             temporal_state: TemporalState
             relation_state:  RelationState
-            prior_state: PropagatePriorState
             kl: kl divergence for all z's. Scalar
             z_pres_likelihood: q(z_pres|x). Scalar
         """
@@ -695,15 +722,20 @@ class SQAIR(nn.Module):
         # Note we also need to mask some of this terms since they do not depend
         # on model parameter. (B, 1) here
         z_pres_likelihood = z_pres_likelihood * prev_relation.object.z_pres.sum(-1)
+        
+        
+        # Compute id. If z_pres = 1, highest_id += 1, and use that id. Otherwise
+        # we do not change the highest id and set id to zero
+        self.highest_id += z_pres
+        id = self.highest_id * z_pres
 
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what)
+        object_state = ObjectState(z_pres, z_where, z_what, id=id)
         
         # For temporal and prior state, we will use the initial state.
         
         B = x.size(0)
         temporal_state = TemporalState.get_initial_state(B, object_state)
-        prior_state = PropagatePriorState.get_initial_state(B, object_state)
         relation_state = RelationState(object_state, h_rel, c_rel)
 
 
@@ -711,18 +743,57 @@ class SQAIR(nn.Module):
         kl = kl.mean()
         z_pres_likelihood = z_pres_likelihood.mean()
         
-        return temporal_state, relation_state, prior_state, kl, z_pres_likelihood
+        return temporal_state, relation_state, kl, z_pres_likelihood
     
-    def rearange(self, temporal_states, prior_states):
+    def rearrange(self, temporal_states):
         """
         Some propagation slots are empty. So we move them to the end.
         Args:
-            temporal_states: a list of length T. Each item is a TemporalState
-            prior_states: a list of length T. Each item is a PropagatePriorState
+            temporal_states: a list of length K or 2K. Each item is a TemporalState
 
         Returns:
-
+            temporal_states: a new list of states. Length will be K.
         """
         
-
-
+        K = len(temporal_states)
+        # TemporalState has six fields, z_where, z_what, z_pres, id. First,
+        # concatenate these into a large tensor
+        z = defaultdict(list)
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c']:
+            for state in temporal_states:
+                z[key].append(state[key])
+            # K * (B, N) ->  (B, K, N)
+            z[key] = torch.stack(z[key], dim=1)
+            
+        # (B, K, 1) -> (B, K, 1)
+        # This is the indices that will be used to rearrange everything.
+        # Note that argsort is not guaranteed to preserve order. But that does
+        # not matter.
+        indices = torch.argsort(z['z_pres'][:,:,0], dim=1)
+        
+        # Since for a of shape (B, K, N), input should be
+        #       output[i, j, k] = in[i, indices[i, j, k], k]
+        # we can implement this as torch.gather.
+        
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c']:
+            # Note we need to expand (B, K, 1) to (B, K, N) for each key
+            z[key] = torch.gather(z[key], dim=1, index=indices.expand(z[key].size()))
+        
+        new_states = []
+        # Now reorganized (B, K, N) -> K * (B, N).
+        # Note that we only collect the first K states even if there are 2K states.
+        # This will not harm.
+        for k in range(K):
+            new_object = ObjectState(
+                z_what=z['z_what'][:, k],
+                z_where=z['z_where'][:, k],
+                z_pres=z['z_pres'][:, k],
+                id=z['id'][:, k],
+            )
+            new_h = z['h'][:, k]
+            new_c = z['c'][:, k]
+            new_state = TemporalState(new_object, new_h, new_c)
+            new_states.append(new_state)
+            
+        return new_states
+        
