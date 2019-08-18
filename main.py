@@ -1,10 +1,16 @@
 import torch
+torch.manual_seed(233)
 import sys
+import os
 import argparse
 from yacs.config import CfgNode
 from lib.seq_mnist_dataset import SequentialMNIST, collate_fn
 from torch.utils.data import DataLoader
 from lib.vimco import SQAIRVIMCO
+from lib.config import cfg
+from torch.optim import Adam
+from tensorboardX import SummaryWriter
+from lib.utils import vis_logger, metric_logger, WeightScheduler
 
 
 
@@ -31,18 +37,48 @@ if __name__ == '__main__':
     # cfg.merge_from_file(args.config)
     # cfg.merge_from_list(args.opts)
     
-    trainset = SequentialMNIST(root=cfg.dataset.seq_mnist, mode='valid')
-    trainloader = DataLoader(trainset, batch_size=4, shuffle=True, num_workers=4,
+    trainset = SequentialMNIST(root=cfg.dataset.seq_mnist, mode='valid', seq_len=cfg.dataset.seq_len)
+    trainloader = DataLoader(trainset, batch_size=cfg.train.batch_size, shuffle=True, num_workers=4,
                              collate_fn=collate_fn)
 
 
-    model = SQAIRVIMCO()
+    model = SQAIRVIMCO().to(cfg.device)
     model.train()
     
-    for i, data in enumerate(trainloader):
-        imgs, nums = data
-        loss = model(imgs)
-        print(i, loss.item())
+    optimizer = Adam(model.parameters(), lr=cfg.train.model_lr)
     
+    writer = SummaryWriter(logdir=os.path.join(cfg.logdir, cfg.exp_name), flush_secs=30)
     
+    weight_scheduler = WeightScheduler(0.0, 1.0, 5000, 20000, 500, model, cfg.device)
+    
+    print('Start training')
+    for epoch in range(cfg.train.max_epochs):
+        for i, data in enumerate(trainloader):
+            global_step = epoch * len(trainloader) + i + 1
+            imgs, nums = data
+            imgs = imgs.to(cfg.device)
+            nums = nums.to(cfg.device)
+            loss = model(imgs)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            weight_scheduler.step()
+            
+            metric_logger.update(loss=loss.item())
+
+            if (i + 1) % 50 == 0:
+                print('Epoch: {}/{}, Iter: {}/{}, Loss: {:.2f}'.format(
+                    epoch + 1, cfg.train.max_epochs, i + 1, len(trainloader), metric_logger['loss'].median))
+                vis_logger.add_to_tensorboard(writer, global_step)
+                writer.add_scalar('loss/loss', metric_logger['loss'].median, global_step)
+                writer.add_scalar('other/reinforce_weight', model.reinforce_weight, global_step)
+                # writer.add_scalar('accuracy/train_total', acc_total, global_step)
+                # writer.add_scalar('accuracy/train_zero', acc_zero, global_step)
+                # writer.add_scalar('accuracy/train_one', acc_one, global_step)
+                # writer.add_scalar('accuracy/train_two', acc_two, global_step)
+                # writer.add_scalar('other/pres_prior_prob', prior_scheduler.current, global_step)
+                # writer.add_scalar('other/reinforce_weight', weight_scheduler.current, global_step)
+
+
+            
 

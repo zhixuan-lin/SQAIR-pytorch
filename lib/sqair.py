@@ -8,12 +8,13 @@ from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
 from .config import cfg
 from collections import defaultdict
+from .utils import vis_logger
 
 
 # default sqair architecture. This is global for convenience
 arch = AttrDict({
     # sequence length
-    'T': 10,
+    'T': cfg.dataset.seq_len,
     # maximum number of objects
     'K': 3,
     
@@ -48,8 +49,8 @@ arch = AttrDict({
     # Prior parameters. Note that this are used ONLY in discover.
     'z_pres_prob_prior': torch.tensor(cfg.anneal.initial, device=cfg.device),
     
-    'z_where_loc_prior': torch.tensor([3.0, 0.0, 0.0], device=cfg.device),
-    'z_where_scale_prior': torch.tensor([0.2, 1.0, 1.0], device=cfg.device),
+    'z_where_loc_prior': torch.tensor([3.0, 3.0, 0.0, 0.0], device=cfg.device),
+    'z_where_scale_prior': torch.tensor([0.2, 0.2, 1.0, 1.0], device=cfg.device),
     'z_what_loc_prior': torch.tensor(0.0, device=cfg.device),
     'z_what_scale_prior': torch.tensor(1.0, device=cfg.device),
     
@@ -59,14 +60,14 @@ arch = AttrDict({
 })
 
 
-class ObjectState(AttrDict):
+class ObjectState:
     """
     An object's state.
     
     This is 'z' in the paper, including presence, where and what.
     """
     
-    def __init__(self, z_pres, z_where, z_what, id):
+    def __init__(self, z_pres, z_where, z_what, id, z_pres_prob):
         """
         Args:
             z_pres:  (B, 1)
@@ -74,13 +75,16 @@ class ObjectState(AttrDict):
             z_what: (B, N)
             id: (B, 1). 0 for empty slots.
         """
-        AttrDict.__init__(
-            self,
-            z_pres=z_pres,
-            z_where=z_where,
-            z_what=z_what,
-            id=id
-        )
+        self.z_pres = z_pres
+        self.z_where = z_where
+        self.z_what = z_what
+        self.id = id
+        
+        # For visualization only
+        self.z_pres_prob = z_pres_prob
+        
+    def __getitem__(self, item):
+        return getattr(self, item)
     
     def get_encoding(self):
         """
@@ -97,7 +101,8 @@ class ObjectState(AttrDict):
             z_pres=torch.ones(B, 1, device=cfg.device),
             z_where=torch.zeros(B, 4, device=cfg.device),
             z_what=torch.zeros(B, arch.z_what_size, device=cfg.device),
-            id = torch.zeros(B, 1, device=cfg.device)
+            id = torch.zeros(B, 1, device=cfg.device),
+            z_pres_prob=None
         )
 
     
@@ -106,11 +111,11 @@ class ObjectState(AttrDict):
         """
         The last dimension of the Tensor returned by get_encoding
         """
-        return arch.z_pres_size + arch.z_where_size + arch.z_pres_size
+        return arch.z_pres_size + arch.z_where_size + arch.z_what_size
     
 # TODO: The following state classes can be avoided if we use a different definition here.
 
-class RelationState(AttrDict):
+class RelationState:
     """
     LSTM State that will be used in Relation RNN.
     
@@ -118,20 +123,30 @@ class RelationState(AttrDict):
     """
     
     def __init__(self, object_state, h, c):
-        AttrDict.__init__(self, h=h, c=c)
-        self.object_state = object_state
+        self.h = h
+        self.c = c
+        self.object = object_state
         
+        
+    def __getitem__(self, item):
+        return getattr(self, item)
+    
+    def __getattr__(self, item):
+        if item not in self.__dict__:
+            return getattr(self.object, item)
+    
+    
     @staticmethod
     def get_initial_state(batch_size, object_state=None):
         B = batch_size
         return RelationState(
             ObjectState.get_initial_state(batch_size) if object_state is None else object_state,
-            h=torch.zeros(B, arch.rnn_relation_hidden_size),
-            c=torch.zeros(B, arch.rnn_relation_hidden_size),
+            h=torch.zeros(B, arch.rnn_relation_hidden_size, device=cfg.device),
+            c=torch.zeros(B, arch.rnn_relation_hidden_size, device=cfg.device),
         )
 
 
-class TemporalState(AttrDict):
+class TemporalState:
     """
     LSTM State that will be used in Relation RNN.
     
@@ -139,23 +154,27 @@ class TemporalState(AttrDict):
     """
     
     def __init__(self, object_state, h, c):
-        AttrDict.__init__(self, h=h, c=c)
-        self.object_state = object_state
+        self.h = h
+        self.c = c
+        self.object = object_state
         
     def __getattr__(self, item):
         if item not in self.__dict__:
-            return getattr(self.object_state, item)
+            return getattr(self.object, item)
+
+    def __getitem__(self, item):
+        return getattr(self, item)
 
     @staticmethod
     def get_initial_state(batch_size, object_state):
         B = batch_size
         return TemporalState(
             ObjectState.get_initial_state(batch_size) if object_state is None else object_state,
-            h=torch.zeros(B, arch.rnn_temporal_hidden_size),
-            c=torch.zeros(B, arch.rnn_temporal_hidden_size),
+            h=torch.zeros(B, arch.rnn_temporal_hidden_size, device=cfg.device),
+            c=torch.zeros(B, arch.rnn_temporal_hidden_size, device=cfg.device),
         )
 
-class PropagatePriorState(AttrDict):
+class PropagatePriorState:
     """
     LSTM State that will be used in prior RNN.
     
@@ -163,7 +182,8 @@ class PropagatePriorState(AttrDict):
     """
     
     def __init__(self, object_state, h, c):
-        AttrDict.__init__(self, h=h, c=c)
+        self.h = h
+        self.c = c
         self.object = object_state
 
     @staticmethod
@@ -209,8 +229,8 @@ class PropagatePredict(nn.Module):
     def __init__(self):
         nn.Module.__init__(self)
         self.fc1 = nn.Linear(
-            arch.embedding_size + arch.temporal_hidden_size
-            + arch.relation_hidden_size, arch.predict_hidden_size)
+            arch.embedding_size + arch.rnn_temporal_hidden_size
+            + arch.rnn_relation_hidden_size, arch.predict_hidden_size)
         # 4 + 1: z_where + z_pres
         self.fc2 = nn.Linear(arch.predict_hidden_size, 4 * 2 + 1)
     
@@ -226,7 +246,7 @@ class PropagatePredict(nn.Module):
         x = self.fc2(F.elu(self.fc1(x)))
         z_where_loc = x[:, :4]
         z_where_scale = F.softplus(x[:, 4:8])
-        z_pres_prob = torch.sigmoid(x[8:])
+        z_pres_prob = torch.sigmoid(x[:, 8:])
         # NOTE: for numerical stability, if z_pres_p is 0 or 1, we will need to
         # clamp it to within (0, 1), or otherwise the gradient will explode
         eps = 1e-6
@@ -245,7 +265,7 @@ class DiscoverPredict(nn.Module):
     def __init__(self):
         nn.Module.__init__(self)
         self.fc1 = nn.Linear(
-            arch.embedding_size + arch.relation_hidden_size, arch.predict_hidden_size)
+            arch.embedding_size + arch.rnn_relation_hidden_size, arch.predict_hidden_size)
         # 4 + 1: z_where + z_pres
         self.fc2 = nn.Linear(arch.predict_hidden_size, 4 * 2 + 1)
     
@@ -261,7 +281,7 @@ class DiscoverPredict(nn.Module):
         x = self.fc2(F.elu(self.fc1(x)))
         z_where_loc = x[:, :4]
         z_where_scale = F.softplus(x[:, 4:8])
-        z_pres_prob = torch.sigmoid(x[8:])
+        z_pres_prob = torch.sigmoid(x[:, 8:])
         # NOTE: for numerical stability, if z_pres_p is 0 or 1, we will need to
         # clamp it to within (0, 1), or otherwise the gradient will explode
         eps = 1e-6
@@ -294,7 +314,7 @@ class Encoder(nn.Module):
         # (B, 2*N)
         x = self.fc2(F.elu(self.fc1(x)))
         # (B, N), (B, N)
-        z_what_loc, z_what_scale = torch.split(x, 2, dim=-1)
+        z_what_loc, z_what_scale = torch.split(x, [arch.z_what_size] * 2, dim=-1)
         z_what_scale = F.softplus(z_what_scale)
         
         return z_what_loc, z_what_scale
@@ -316,9 +336,11 @@ class Decoder(nn.Module):
         Returns:
             glimpse: (B, 1, H, W)
         """
+        BIAS = -2.0
         B = z_what.size(0)
         x = self.fc2(F.elu(self.fc1(z_what)))
-        x = F.sigmoid(x)
+        # This bias makes initial outputs empty
+        x = F.sigmoid(x + BIAS)
         x = x.view(B, 1, *arch.glimpse_shape)
         
         return x
@@ -347,7 +369,7 @@ class PropagatePrior(nn.Module):
         """
         z = self.fc2(F.elu(self.fc1(x)))
         z_what_loc, z_what_scale, z_where_loc, z_where_scale, z_pres_prob = \
-            torch.split(x, [arch.z_what_size] * 2 + [4] * 2 + [1])
+            torch.split(z, [arch.z_what_size] * 2 + [4] * 2 + [1], dim=-1)
         z_what_scale = F.softplus(z_what_scale)
         z_where_scale = F.softplus(z_where_scale)
         z_pres_prob = torch.sigmoid(z_pres_prob)
@@ -417,7 +439,7 @@ class SpatialTransformer(nn.Module):
         z_where = torch.cat((z_where, padding), dim=-1)
         
         # Rearange to (sx, 0, x, 0, sy, y)
-        expansion_indices = torch.tensor([0, 4, 2, 5, 1, 3])
+        expansion_indices = torch.tensor([0, 4, 2, 5, 1, 3], device=cfg.device)
         matrix = torch.index_select(z_where, dim=-1, index=expansion_indices)
         matrix = matrix.view(-1, 2, 3)
         
@@ -500,11 +522,25 @@ class SQAIR(nn.Module):
         self.highest_id = torch.zeros(B, 1, device=x.device)
         # (B,)
         likelihood_total = 0.0
+
+        # Finally this will be a list of list of caanvases
+        vis_logger['canvas'] = []
+        vis_logger['z_pres'] = []
+        vis_logger['z_pres_prob'] = []
+        vis_logger['z_where'] = []
+        vis_logger['id'] = []
+        vis_logger['imgs'] = []
         
-        for t in arch.T:
+        # Append T*K items
+        vis_logger['kl_pres_list'] = []
+        vis_logger['kl_what_list'] = []
+        vis_logger['kl_where_list'] = []
+
+        for t in range(arch.T):
             # Enter time step t
             # (B, 1, H, W)
             image = x[t]
+            vis_logger['imgs'].append(image[0][0])
             # Compute embedding for this image (B, N)
             image_embed = self.embedding(image)
             
@@ -546,12 +582,18 @@ class SQAIR(nn.Module):
             
             # Extract object list
             object_list = [state.object for state in state_tem_list_prev]
+            
+            
             # Reconstruct and compute likelihood
             recons, ll = self.reconstruct(object_list, image)
             likelihood_total += ll
             
             
         elbo = likelihood_total - kl_total
+        
+        vis_logger['kl'] = kl_total.mean()
+        vis_logger['likelihood'] = likelihood_total.mean()
+        vis_logger['elbo'] = elbo.mean()
         
         return elbo, z_pres_likelihood_total
             
@@ -615,7 +657,7 @@ class SQAIR(nn.Module):
         z_what_loc, z_what_scale = self.encoder(glimpse)
         z_what_post = Normal(z_what_loc, z_what_scale)
         # (B, N)
-        z_what = z_where_post.rsample()
+        z_what = z_what_post.rsample()
         # Mask
         z_what = z_what * z_pres
         
@@ -650,6 +692,11 @@ class SQAIR(nn.Module):
         kl_z_what = kl_z_what * z_pres
         kl_z_where = kl_z_where * z_pres
         kl_z_pres = kl_z_pres * prev_temporal.object.z_pres
+        
+        vis_logger['kl_pres_list'].append(kl_z_pres.mean())
+        vis_logger['kl_what_list'].append(kl_z_what.mean())
+        vis_logger['kl_where_list'].append(kl_z_where.mean())
+
         # (B,) here, after reduction
         kl = kl_z_what.sum(dim=-1) + kl_z_where.sum(dim=-1) + kl_z_pres.sum(dim=-1)
         
@@ -658,14 +705,15 @@ class SQAIR(nn.Module):
         
         # Note we also need to mask some of this terms since they do not depend
         # on model parameter. (B, 1) here
-        z_pres_likelihood = z_pres_likelihood * prev_temporal.object.z_pres.sum(-1)
+        z_pres_likelihood = z_pres_likelihood * prev_temporal.object.z_pres
+        z_pres_likelihood = z_pres_likelihood.squeeze()
         
         # Compute id. If z_pres is 1, then inherit that id. Otherwise set it to
         # zero
         id = prev_temporal.object.id * z_pres
         
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what, id)
+        object_state = ObjectState(z_pres, z_where, z_what, id, z_pres_prob=z_pres_prob)
         temporal_state = TemporalState(object_state, h_tem, c_tem)
         relation_state = RelationState(object_state, h_rel, c_rel)
         
@@ -725,7 +773,7 @@ class SQAIR(nn.Module):
         z_what_loc, z_what_scale = self.encoder(glimpse)
         z_what_post = Normal(z_what_loc, z_what_scale)
         # (B, N)
-        z_what = z_where_post.rsample()
+        z_what = z_what_post.rsample()
         # Mask
         z_what = z_what * z_pres
 
@@ -750,6 +798,11 @@ class SQAIR(nn.Module):
         kl_z_what = kl_z_what * z_pres
         kl_z_where = kl_z_where * z_pres
         kl_z_pres = kl_z_pres * prev_relation.object.z_pres
+        
+        vis_logger['kl_pres_list'].append(kl_z_pres.mean())
+        vis_logger['kl_what_list'].append(kl_z_what.mean())
+        vis_logger['kl_where_list'].append(kl_z_where.mean())
+        
         # (B,) here, after reduction
         kl = kl_z_what.sum(dim=-1) + kl_z_where.sum(dim=-1) + kl_z_pres.sum(dim=-1)
 
@@ -758,7 +811,8 @@ class SQAIR(nn.Module):
 
         # Note we also need to mask some of this terms since they do not depend
         # on model parameter. (B, 1) here
-        z_pres_likelihood = z_pres_likelihood * prev_relation.object.z_pres.sum(-1)
+        z_pres_likelihood = z_pres_likelihood * prev_relation.object.z_pres
+        z_pres_likelihood = z_pres_likelihood.squeeze()
         
         
         # Compute id. If z_pres = 1, highest_id += 1, and use that id. Otherwise
@@ -767,7 +821,7 @@ class SQAIR(nn.Module):
         id = self.highest_id * z_pres
 
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what, id=id)
+        object_state = ObjectState(z_pres, z_where, z_what, id=id, z_pres_prob=z_pres_prob)
         
         # For temporal and prior state, we will use the initial state.
         
@@ -792,7 +846,7 @@ class SQAIR(nn.Module):
         # TemporalState has six fields, z_where, z_what, z_pres, id. First,
         # concatenate these into a large tensor
         z = defaultdict(list)
-        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c']:
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob']:
             for state in temporal_states:
                 z[key].append(state[key])
             # K * (B, N) ->  (B, K, N)
@@ -802,15 +856,17 @@ class SQAIR(nn.Module):
         # This is the indices that will be used to rearrange everything.
         # Note that argsort is not guaranteed to preserve order. But that does
         # not matter.
-        indices = torch.argsort(z['z_pres'][:,:,0], dim=1)
+        
+        # This is ugly, but it preserves the order.
+        indices = torch.argsort((1.0 - z['z_pres']) * 1000 + z['id'], dim=1)
         
         # Since for a of shape (B, K, N), input should be
         #       output[i, j, k] = in[i, indices[i, j, k], k]
         # we can implement this as torch.gather.
         
-        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c']:
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob']:
             # Note we need to expand (B, K, 1) to (B, K, N) for each key
-            z[key] = torch.gather(z[key], dim=1, index=indices.expand(z[key].size()))
+            z[key] = torch.gather(z[key], dim=1, index=indices.expand_as(z[key]))
         
         new_states = []
         # Now reorganized (B, K, N) -> K * (B, N).
@@ -822,6 +878,7 @@ class SQAIR(nn.Module):
                 z_where=z['z_where'][:, k],
                 z_pres=z['z_pres'][:, k],
                 id=z['id'][:, k],
+                z_pres_prob=z['z_pres_prob'][:, k],
             )
             new_h = z['h'][:, k]
             new_c = z['c'][:, k]
@@ -845,17 +902,41 @@ class SQAIR(nn.Module):
         
         B = img.size(0)
         canvas = torch.zeros_like(img)
+
+        vis_logger['canvas_cur'] = []
+        vis_logger['z_pres_cur'] = []
+        vis_logger['z_where_cur'] = []
+        vis_logger['z_pres_prob_cur'] = []
+        vis_logger['id_cur'] = []
         
         for obj in object_list:
             # Decode to (B, 1, H, W)
             glimpse = self.decoder(obj.z_what)
             # Transform to image size
-            recons = self.glimpse_to_image(glimpse, inverse=False)
+            recons = self.glimpse_to_image(glimpse, obj.z_where, inverse=False)
             
             # (B, 1, 1, 1)
             mask = obj.z_pres[:,:,None,None]
+            # (B, 1, H, W)
             canvas = canvas + mask * recons
             
+            # (H, W)
+            vis_logger['canvas_cur'].append(canvas[0][0])
+            # Scalar
+            vis_logger['z_pres_cur'].append(obj.z_pres[0][0])
+            # Scalar
+            vis_logger['z_pres_prob_cur'].append(obj.z_pres_prob[0][0])
+            # (4,)
+            vis_logger['z_where_cur'].append(obj.z_where[0])
+            # Scalar
+            vis_logger['id_cur'].append(obj.id[0][0])
+
+        vis_logger['canvas'].append(vis_logger['canvas_cur'])
+        vis_logger['z_pres'].append(vis_logger['z_pres_cur'])
+        vis_logger['z_pres_prob'].append(vis_logger['z_pres_prob_cur'])
+        vis_logger['z_where'].append(vis_logger['z_where_cur'])
+        vis_logger['id'].append(vis_logger['id_cur'])
+        
         # Construct output distribution
         output_dist = Normal(canvas, arch.x_scale.expand(canvas.size()))
         

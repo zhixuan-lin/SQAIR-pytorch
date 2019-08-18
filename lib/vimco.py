@@ -6,13 +6,15 @@ from .sqair import SQAIR
 from torch import nn
 import math
 from torch.nn import functional as F
+from lib.utils import vis_logger
 
 class SQAIRVIMCO(nn.Module):
-    def __init__(self, k=5, arch_update=None):
+    def __init__(self, k=5, arch_update=None, init_reinforce_weight=0.0):
         nn.Module.__init__(self)
         self.sqair = SQAIR(arch_update)
         # Number of samples
         self.K = k
+        self.reinforce_weight=0.0
         
     def forward(self, x):
         """
@@ -32,7 +34,7 @@ class SQAIRVIMCO(nn.Module):
         x = x.expand(T, B, self.K, C, H, W)
         
         # reshape to (T, B*K, C, H, W)
-        x = x.view(T, B*self.K, C, H, W)
+        x = x.contiguous().view(T, B*self.K, C, H, W)
         
         # (B*K,) and (B*K,)
         log_weights, z_pres_likelihood = self.sqair(x)
@@ -59,8 +61,12 @@ class SQAIRVIMCO(nn.Module):
         # (B,)
         reinforce_term = reinforce_term.sum(1)
         
+        vis_logger['reinforce_term'] = reinforce_term.mean()
+        
         # Remember we are doing maximization here
-        loss = (iwae_term - reinforce_term).mean()
+        # We maximize iwae term and reinforce term
+        loss = (-iwae_term - self.reinforce_weight * reinforce_term).mean()
+        # loss = (-iwae_term ).mean()
         return loss
         
     
@@ -82,15 +88,16 @@ class SQAIRVIMCO(nn.Module):
         log_weights_sum = log_weights.sum(dim=-1, keepdim=True)
         # (B, K)
         leave_one_out_sum = log_weights_sum - log_weights
-        log_weights_estimate = leave_one_out_sum.sum(dim=-1) / (self.K - 1.0)
+        log_weights_estimate = leave_one_out_sum / (self.K - 1.0)
         
         # We replace h[i] in log_weights with out estimate
         # This implementation requires some trick.
-        # (B, K, 1) (will be broadcast to (B, K, K) later)
-        log_weights = log_weights[:, :, None]
         
         # This log_weights_estimate - log_weights
         replacer = torch.diag_embed(log_weights_estimate - log_weights)
+
+        # (B, K, 1) (will be broadcast to (B, K, K) later)
+        log_weights = log_weights[:, :, None]
         
         # (B, K, K)
         estimate = log_weights + replacer

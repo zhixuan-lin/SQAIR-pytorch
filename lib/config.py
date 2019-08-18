@@ -2,16 +2,14 @@ from attrdict import AttrDict
 import os
 
 cfg = AttrDict({
-    # 'exp_name': 'test',
-    # 'exp_name': 'anneal',
-    # 'exp_name': 'weight',
-    # 'exp_name': 'double_anneal',
-    'exp_name': 'double_anneal_from05',
-    # 'exp_name': 'no_rein',
-    # 'exp_name': 'test_05',
-    # 'exp_name': 'noreinforce',
+    'exp_name': 'test-len2',
     'resume': True,
-    'device': 'cpu',
+    'device': 'cuda:3',
+    'dataset': {
+        'seq_mnist': 'data/seq_mnist',
+        'seq_len': 2
+    },
+    
     'train': {
         'batch_size': 64,
         'model_lr': 1e-4,
@@ -29,5 +27,4 @@ cfg = AttrDict({
     },
     'logdir': 'logs/',
     'checkpointdir': 'checkpoint/',
-    'multi_mnist_path': os.path.join('data', 'multi_mnist')
 })

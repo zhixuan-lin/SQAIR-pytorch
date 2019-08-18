@@ -9,11 +9,12 @@ class SequentialMNIST(Dataset):
     """
     Sequential multi-mnist dataset
     """
-    def __init__(self, root, mode):
+    def __init__(self, root, mode, seq_len):
         """
         Args:
             root: directory path
             mode: either ['train', 'valid']
+            len: sequence length
         """
         assert mode in ['train', 'valid'], 'Invalid dataset mode'
         Dataset.__init__(self)
@@ -28,9 +29,9 @@ class SequentialMNIST(Dataset):
             dataset = pickle.load(f, encoding='latin1')
             
         # (T, N, H, W)
-        self.imgs = dataset['imgs']
+        self.imgs = dataset['imgs'][:seq_len]
         # (N, 2), numbers in the digits
-        self.labels = dataset['imgs']
+        self.labels = dataset['labels']
         # (T, N, 2, 4), the last dimension being [x, y, w, h]
         self.coords = dataset['coords']
         # (1, N, 3), bool
@@ -51,18 +52,25 @@ class SequentialMNIST(Dataset):
         
         # (T, H, W)
         imgs = self.imgs[:, index]
+        # (1,)
+        nums = self.nums[:, index].astype(np.float)
+        
+        imgs = imgs.astype(np.float) / 255.0
+        imgs = torch.from_numpy(imgs).float()
+        nums = torch.from_numpy(nums).float()
+        
         T = imgs.size(0)
         # (T, 1, C, H, W)
         imgs = imgs[:, None, None]
         # (1, 1)
-        nums = self.nums[index][:, None]
         # (1, 1) -> (T, 1)
         nums = nums.expand(T, 1)
+        
         
         return imgs, nums
     
     def __len__(self):
-        return self.imgs.size(1)
+        return self.imgs.shape[1]
     
     
 def collate_fn(samples):
