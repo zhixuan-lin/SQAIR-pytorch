@@ -10,7 +10,7 @@ from lib.vimco import SQAIRVIMCO
 from lib.config import cfg
 from torch.optim import Adam
 from tensorboardX import SummaryWriter
-from lib.utils import vis_logger, metric_logger, WeightScheduler
+from lib.utils import vis_logger, metric_logger, WeightScheduler, Checkpointer
 
 
 
@@ -37,7 +37,7 @@ if __name__ == '__main__':
     # cfg.merge_from_file(args.config)
     # cfg.merge_from_list(args.opts)
     
-    trainset = SequentialMNIST(root=cfg.dataset.seq_mnist, mode='valid', seq_len=cfg.dataset.seq_len)
+    trainset = SequentialMNIST(root=cfg.dataset.seq_mnist, mode='train', seq_len=cfg.dataset.seq_len)
     trainloader = DataLoader(trainset, batch_size=cfg.train.batch_size, shuffle=True, num_workers=4,
                              collate_fn=collate_fn)
 
@@ -47,12 +47,19 @@ if __name__ == '__main__':
     
     optimizer = Adam(model.parameters(), lr=cfg.train.model_lr)
     
+    
+    weight_scheduler = WeightScheduler(0.0, 1.0, 10000, 20000, 500, model, cfg.device)
+    
+    checkpointer = Checkpointer(os.path.join(cfg.checkpointdir, cfg.exp_name))
+
+    start_epoch = 0
+    if cfg.resume:
+        start_epoch = checkpointer.load(model, optimizer)
+        
     writer = SummaryWriter(logdir=os.path.join(cfg.logdir, cfg.exp_name), flush_secs=30)
     
-    weight_scheduler = WeightScheduler(0.0, 1.0, 5000, 20000, 500, model, cfg.device)
-    
     print('Start training')
-    for epoch in range(cfg.train.max_epochs):
+    for epoch in range(start_epoch, cfg.train.max_epochs):
         for i, data in enumerate(trainloader):
             global_step = epoch * len(trainloader) + i + 1
             imgs, nums = data
@@ -78,6 +85,10 @@ if __name__ == '__main__':
                 # writer.add_scalar('accuracy/train_two', acc_two, global_step)
                 # writer.add_scalar('other/pres_prior_prob', prior_scheduler.current, global_step)
                 # writer.add_scalar('other/reinforce_weight', weight_scheduler.current, global_step)
+                
+
+        if epoch % 2 == 0:
+            checkpointer.save(model, optimizer, epoch+1)
 
 
             

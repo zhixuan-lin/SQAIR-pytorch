@@ -367,12 +367,16 @@ class PropagatePrior(nn.Module):
             z_what_loc, z_what_scale, z_where_loc, z_where_scale, z_pres_prob.
             All with shape (B, N).
         """
+        BIAS = 3.0
         z = self.fc2(F.elu(self.fc1(x)))
         z_what_loc, z_what_scale, z_where_loc, z_where_scale, z_pres_prob = \
             torch.split(z, [arch.z_what_size] * 2 + [4] * 2 + [1], dim=-1)
         z_what_scale = F.softplus(z_what_scale)
         z_where_scale = F.softplus(z_where_scale)
-        z_pres_prob = torch.sigmoid(z_pres_prob)
+        
+        # For propagate prior, the object is very likely to be propagated, so we
+        # add a bias here.
+        z_pres_prob = torch.sigmoid(z_pres_prob + BIAS)
         eps = 1e-6
         z_pres_prob = z_pres_prob + eps * (z_pres_prob == 0).float() - eps * (z_pres_prob == 1).float()
         

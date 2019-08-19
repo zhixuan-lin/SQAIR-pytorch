@@ -14,7 +14,8 @@ from matplotlib import pyplot as plt
 from torch.distributions.bernoulli import Bernoulli
 
 
-colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'w']
+# Times 10 to prevent index out of bound.
+colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'w'] * 10
 
 class VisLogger:
     """
@@ -194,6 +195,8 @@ class Checkpointer:
     def __init__(self, path, max_num=3):
         self.max_num = max_num
         self.path = path
+        if not os.path.exists(path):
+            os.makedirs(path)
         self.listfile = os.path.join(path, 'model_list.pkl')
         if not os.path.exists(self.listfile):
             with open(self.listfile, 'wb') as f:
@@ -212,7 +215,8 @@ class Checkpointer:
         with open(self.listfile, 'rb+') as f:
             model_list = pickle.load(f)
             if len(model_list) >= self.max_num:
-                os.remove(model_list[0])
+                if os.path.exists(model_list[0]):
+                    os.remove(model_list[0])
                 del model_list[0]
             model_list.append(filename)
         with open(self.listfile, 'rb+') as f:
