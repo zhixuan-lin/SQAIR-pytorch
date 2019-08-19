@@ -10,6 +10,7 @@ from .config import cfg
 from collections import defaultdict
 from .utils import vis_logger
 
+DEBUG = False
 
 # default sqair architecture. This is global for convenience
 arch = AttrDict({
@@ -39,6 +40,9 @@ arch = AttrDict({
     # predict
     'predict_hidden_size': 256,
     
+    # proposal
+    'proposal_hidden_size': 256,
+    
     # encode object into z_what
     'encoder_hidden_size': 256,
     'decoder_hidden_size': 256,
@@ -53,6 +57,16 @@ arch = AttrDict({
     'z_where_scale_prior': torch.tensor([0.2, 0.2, 1.0, 1.0], device=cfg.device),
     'z_what_loc_prior': torch.tensor(0.0, device=cfg.device),
     'z_what_scale_prior': torch.tensor(1.0, device=cfg.device),
+    
+    # Used in propagation
+    # Favor no change
+    'z_where_delta_loc_prior': torch.tensor([0.0, 0.0, 0.0, 0.0], device=cfg.device),
+    # With very small deviation
+    'z_where_delta_scale_prior': torch.tensor([0.1, 0.1, 0.3, 0.3], device=cfg.device),
+    # Favor no change
+    'z_what_delta_loc_prior': torch.tensor(0.0, device=cfg.device),
+    # With very small deviation
+    'z_what_delta_scale_prior': torch.tensor(0.1, device=cfg.device),
     
     # output prior
     'x_scale': torch.tensor(0.3, device=cfg.device)
@@ -217,6 +231,27 @@ class Embedding(nn.Module):
         img = img.view(B, -1)
         return self.fc2(F.elu(self.fc1(img)))
 
+class ProposalEmbedding(nn.Module):
+    """
+    Embedding the proposal region into feature
+    """
+    
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.fc1 = nn.Linear(arch.glimpse_size, arch.embedding_hidden_size)
+        self.fc2 = nn.Linear(arch.embedding_hidden_size, arch.embedding_size)
+    
+    def forward(self, proposal):
+        """
+        Args:
+            proposal: (B, C, H, W)
+
+        Returns:
+            Embeded feature. (B, N)
+        """
+        B = proposal.size(0)
+        proposal = proposal.view(B, -1)
+        return self.fc2(F.elu(self.fc1(proposal)))
 
 class PropagatePredict(nn.Module):
     """
@@ -236,6 +271,7 @@ class PropagatePredict(nn.Module):
     
     def forward(self, x):
         """
+        Note the loc computed is DELTA.
         Args:
             x: feature encoding h^T, h^R, img
         Returns:
@@ -291,9 +327,11 @@ class DiscoverPredict(nn.Module):
 
 
 
-class Encoder(nn.Module):
+class DiscoverEncoder(nn.Module):
     """
-    Encoder glimpse into parameters of z_what distribution
+    Encoder glimpse into parameters of z_what distribution.
+    
+    This is only used in discover. No temporal information is fed in.
     """
     
     def __init__(self):
@@ -319,6 +357,40 @@ class Encoder(nn.Module):
         
         return z_what_loc, z_what_scale
     
+class PropagateEncoder(nn.Module):
+    """
+    Encoder glimpse into parameters of z_what distribution.
+    
+    This is only used in propagate. Temporal information is used.
+    """
+    
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.fc1 = nn.Linear(arch.glimpse_size + arch.rnn_temporal_hidden_size +
+                             arch.rnn_relation_hidden_size, arch.encoder_hidden_size)
+        # 4 + 1: z_where + z_pres
+        self.fc2 = nn.Linear(arch.encoder_hidden_size, 2 * arch.z_what_size)
+    
+    def forward(self, x, hidden_tem, hidden_rel):
+        """
+        Args:
+            x: glimpse. Shape (B, 1, H, W)
+            hidden_tem: temporal hidden state. (B, N)
+            hidden_rel: relation hidden state. (B, N)
+        Returns:
+            z_what_loc: (B, N)
+            z_what_scale: (B, N)
+        """
+        x = x.view(x.size(0), -1)
+        x = torch.cat([x, hidden_tem, hidden_rel], dim=-1)
+        # (B, 2*N)
+        x = self.fc2(F.elu(self.fc1(x)))
+        # (B, N), (B, N)
+        z_what_loc_delta, z_what_scale_delta = torch.split(x, [arch.z_what_size] * 2, dim=-1)
+        z_what_scale_delta = F.softplus(z_what_scale_delta)
+        
+        return z_what_loc_delta, z_what_scale_delta
+    
 class Decoder(nn.Module):
     """
     Decoder z_what into glimpse.
@@ -340,7 +412,7 @@ class Decoder(nn.Module):
         B = z_what.size(0)
         x = self.fc2(F.elu(self.fc1(z_what)))
         # This bias makes initial outputs empty
-        x = F.sigmoid(x + BIAS)
+        x = torch.sigmoid(x + BIAS)
         x = x.view(B, 1, *arch.glimpse_shape)
         
         return x
@@ -381,6 +453,31 @@ class PropagatePrior(nn.Module):
         z_pres_prob = z_pres_prob + eps * (z_pres_prob == 0).float() - eps * (z_pres_prob == 1).float()
         
         return z_what_loc, z_what_scale, z_where_loc, z_where_scale, z_pres_prob
+    
+class PropagateProposal(nn.Module):
+    """
+    During propagate, given temporal states, predict a proposal region to look at
+    """
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.fc1 = nn.Linear(
+             arch.rnn_temporal_hidden_size, arch.proposal_hidden_size)
+        # 4 + 1: z_where + z_pres
+        self.fc2 = nn.Linear(arch.proposal_hidden_size, 4)
+
+    def forward(self, x):
+        """
+        Args:
+            x: temporal hidden state, (B, N)
+        Returns:
+            proposal: proposal region. (B, 4)
+        """
+        proposal = self.fc2(F.elu(self.fc1(x)))
+        
+        BIAS = 1.5
+        proposal[:, :2] = proposal[:, :2] - BIAS
+    
+        return proposal
 
 
 class SpatialTransformer(nn.Module):
@@ -492,7 +589,8 @@ class SQAIR(nn.Module):
         self.image_to_glimpse = SpatialTransformer(arch.input_shape, arch.glimpse_shape)
         
         # Encode glimpse into z_what parameters
-        self.encoder = Encoder()
+        self.discover_encoder = DiscoverEncoder()
+        self.propagate_encoder = PropagateEncoder()
         self.decoder = Decoder()
 
         # This is a module, computing current prior parameters from previous
@@ -500,8 +598,12 @@ class SQAIR(nn.Module):
         self.propagate_prior = PropagatePrior()
         
         
+        # Proposal region
+        self.propagate_proposal = PropagateProposal()
+        
         # Embedding layer
         self.embedding = Embedding()
+        self.proposal_embedding = ProposalEmbedding()
         
         
         # Per-batch current highest id. Shape (B, 1). Initialized later.
@@ -600,11 +702,8 @@ class SQAIR(nn.Module):
         vis_logger['elbo'] = elbo.mean()
         
         return elbo, z_pres_likelihood_total
-            
-            
-            
-        
-    
+
+    i = 0
     def propagate(self, x, x_embed, prev_relation, prev_temporal):
         """
         Propagate step for a single object in a single time step.
@@ -633,11 +732,25 @@ class SQAIR(nn.Module):
                                          (prev_relation.h, prev_relation.c))
         h_tem, c_tem = self.rnn_temporal(prev_temporal.object.get_encoding(),
                                          (prev_temporal.h, prev_temporal.c))
+        
+        # Compute proposal region to look at
+        # (B, 4)
+        # proposal_region_delta = self.propagate_proposal(h_tem)
+        # proposal_region = prev_temporal.object.z_where + proposal_region_delta
+        # self.i += 1
+        # if self.i % 1000 == 0:
+        #     print(proposal_region[0])
+        # proposal = self.image_to_glimpse(x, proposal_region, inverse=True)
+        # proposal_embed = self.proposal_embedding(proposal)
+        
         # (B, N)
         # Predict where and pres, using h^T, h^T and x
         predict_input = torch.cat((h_rel, h_tem, x_embed), dim=-1)
+        if DEBUG:
+            predict_input = torch.cat((torch.zeros_like(h_rel), h_tem, x_embed), dim=-1)
         # (B, 4), (B, 4), (B, 1)
-        z_where_loc, z_where_scale, z_pres_prob = self.propagate_predict(predict_input)
+        # Note we only predict delta here.
+        z_where_delta_loc, z_where_delta_scale, z_pres_prob = self.propagate_predict(predict_input)
         
         # Sample from z_pres posterior. Shape (B, 1)
         # NOTE: don't use zero probability otherwise log q(z|x) will not work
@@ -649,8 +762,9 @@ class SQAIR(nn.Module):
         z_pres = z_pres * prev_temporal.object.z_pres
         
         # Sample from z_where posterior, (B, 4)
-        z_where_post = Normal(z_where_loc, z_where_scale)
-        z_where = z_where_post.rsample()
+        z_where_delta_post = Normal(z_where_delta_loc, z_where_delta_scale)
+        z_where_delta = z_where_delta_post.rsample()
+        z_where = prev_temporal.z_where + z_where_delta
         # Mask
         z_where = z_where * z_pres
         
@@ -658,10 +772,13 @@ class SQAIR(nn.Module):
         glimpse = self.image_to_glimpse(x, z_where, inverse=True)
         
         # Compute postribution over z_what and sample
-        z_what_loc, z_what_scale = self.encoder(glimpse)
-        z_what_post = Normal(z_what_loc, z_what_scale)
+        z_what_delta_loc, z_what_delta_scale = self.propagate_encoder(glimpse, h_tem, h_rel)
+        if DEBUG:
+            z_what_delta_loc, z_what_delta_scale = self.propagate_encoder(glimpse, h_tem, torch.zeros_like(h_rel))
+        z_what_delta_post = Normal(z_what_delta_loc, z_what_delta_scale)
         # (B, N)
-        z_what = z_what_post.rsample()
+        z_what_delta = z_what_delta_post.rsample()
+        z_what = prev_temporal.z_what + z_what_delta
         # Mask
         z_what = z_what * z_pres
         
@@ -671,18 +788,18 @@ class SQAIR(nn.Module):
         
         
         # Compute prior for current step
-        (z_what_loc_prior, z_what_scale_prior, z_where_loc_prior,
-            z_where_scale_prior, z_pres_prob_prior) = (
+        (z_what_delta_loc_prior, z_what_delta_scale_prior, z_where_delta_loc_prior,
+            z_where_delta_scale_prior, z_pres_prob_prior) = (
             self.propagate_prior(h_tem))
         
         # Construct prior distributions
-        z_what_prior = Normal(z_what_loc_prior, z_what_scale_prior)
-        z_where_prior = Normal(z_where_loc_prior, z_where_scale_prior)
+        z_what_delta_prior = Normal(z_what_delta_loc_prior, z_what_delta_scale_prior)
+        z_where_delta_prior = Normal(z_where_delta_loc_prior, z_where_delta_scale_prior)
         z_pres_prior = Bernoulli(z_pres_prob_prior)
         
         # Compute KL divergence. Each (B, N)
-        kl_z_what = kl_divergence(z_what_post, z_what_prior)
-        kl_z_where = kl_divergence(z_where_post, z_where_prior)
+        kl_z_what = kl_divergence(z_what_delta_post, z_what_delta_prior)
+        kl_z_where = kl_divergence(z_where_delta_post, z_where_delta_prior)
         kl_z_pres = kl_divergence(z_pres_post, z_pres_prior)
         
         # Mask these terms.
@@ -774,7 +891,7 @@ class SQAIR(nn.Module):
         glimpse = self.image_to_glimpse(x, z_where, inverse=True)
 
         # Compute postribution over z_what and sample
-        z_what_loc, z_what_scale = self.encoder(glimpse)
+        z_what_loc, z_what_scale = self.discover_encoder(glimpse)
         z_what_post = Normal(z_what_loc, z_what_scale)
         # (B, N)
         z_what = z_what_post.rsample()
