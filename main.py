@@ -1,5 +1,5 @@
 import torch
-torch.manual_seed(888)
+torch.manual_seed(234)
 import sys
 import os
 import argparse
@@ -69,7 +69,7 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            weight_scheduler.step()
+            weight_scheduler.step(global_step)
             
             metric_logger.update(loss=loss.item())
 
@@ -87,8 +87,7 @@ if __name__ == '__main__':
                 # writer.add_scalar('other/reinforce_weight', weight_scheduler.current, global_step)
                 
 
-        if epoch % 2 == 0:
-            checkpointer.save(model, optimizer, epoch+1)
+        checkpointer.save(model, optimizer, epoch+1)
 
 
             

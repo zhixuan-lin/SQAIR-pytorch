@@ -2,13 +2,17 @@ from attrdict import AttrDict
 import os
 
 cfg = AttrDict({
-    'exp_name': 'test-len10-delta',
-    'resume': False,
-    'device': 'cuda:2',
+    # 'exp_name': 'test-len10-delta',
+    # 'exp_name': 'test-len1-fixedscale-aggre-super',
+    # 'exp_name': 'test-aggre-super',
+    # 'exp_name': 'test-mask',
+    'exp_name': 'test-proposal',
+    'resume': True,
+    'device': 'cuda:3',
     # 'device': 'cpu',
     'dataset': {
         'seq_mnist': 'data/seq_mnist',
-        'seq_len': 10
+        'seq_len': 2
     },
     
     'train': {

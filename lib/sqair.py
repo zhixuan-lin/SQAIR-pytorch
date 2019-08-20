@@ -43,6 +43,9 @@ arch = AttrDict({
     # proposal
     'proposal_hidden_size': 256,
     
+    # glimpse mask
+    'glimpse_mask_hidden_size': 256,
+    
     # encode object into z_what
     'encoder_hidden_size': 256,
     'decoder_hidden_size': 256,
@@ -62,11 +65,13 @@ arch = AttrDict({
     # Favor no change
     'z_where_delta_loc_prior': torch.tensor([0.0, 0.0, 0.0, 0.0], device=cfg.device),
     # With very small deviation
-    'z_where_delta_scale_prior': torch.tensor([0.1, 0.1, 0.3, 0.3], device=cfg.device),
+    'z_where_delta_scale_prior': torch.tensor([0.1, 0.1, 0.6, 0.6], device=cfg.device),
+    # 'z_where_delta_scale_prior': torch.tensor([0.1, 0.1, 0.3, 0.3], device=cfg.device),
     # Favor no change
     'z_what_delta_loc_prior': torch.tensor(0.0, device=cfg.device),
     # With very small deviation
-    'z_what_delta_scale_prior': torch.tensor(0.1, device=cfg.device),
+    # 'z_what_delta_scale_prior': torch.tensor(0.5, device=cfg.device),
+    'z_what_delta_scale_prior': torch.tensor(0.2, device=cfg.device),
     
     # output prior
     'x_scale': torch.tensor(0.3, device=cfg.device)
@@ -81,8 +86,11 @@ class ObjectState:
     This is 'z' in the paper, including presence, where and what.
     """
     
-    def __init__(self, z_pres, z_where, z_what, id, z_pres_prob):
+    def __init__(self, z_pres, z_where, z_what, id, z_pres_prob, object_enc, mask, proposal):
         """
+        Constructor
+        
+        z_pres_prob and object_enc are for visualization only
         Args:
             z_pres:  (B, 1)
             z_where: (B, 4)
@@ -96,6 +104,9 @@ class ObjectState:
         
         # For visualization only
         self.z_pres_prob = z_pres_prob
+        self.object_enc = object_enc
+        self.mask = mask
+        self.proposal = proposal
         
     def __getitem__(self, item):
         return getattr(self, item)
@@ -116,7 +127,10 @@ class ObjectState:
             z_where=torch.zeros(B, 4, device=cfg.device),
             z_what=torch.zeros(B, arch.z_what_size, device=cfg.device),
             id = torch.zeros(B, 1, device=cfg.device),
-            z_pres_prob=None
+            z_pres_prob=None,
+            object_enc=None,
+            mask=None,
+            proposal=None
         )
 
     
@@ -357,6 +371,28 @@ class DiscoverEncoder(nn.Module):
         
         return z_what_loc, z_what_scale
     
+class GlimpseMask(nn.Module):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.fc1 = nn.Linear(arch.rnn_temporal_hidden_size, arch.glimpse_mask_hidden_size)
+        # 4 + 1: z_where + z_pres
+        self.fc2 = nn.Linear(arch.glimpse_mask_hidden_size, arch.glimpse_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: temporal hidden state. (B, N)
+        Returns:
+            mask: (B, 1, H, W), mask over glimpse
+        """
+        
+        BIAS = 0.0
+        
+        x = self.fc2(F.elu(self.fc1(x)))
+        x = torch.sigmoid(x + BIAS)
+        H, W = arch.glimpse_shape
+        return x.view(-1, 1, H, W)
+    
 class PropagateEncoder(nn.Module):
     """
     Encoder glimpse into parameters of z_what distribution.
@@ -474,8 +510,7 @@ class PropagateProposal(nn.Module):
         """
         proposal = self.fc2(F.elu(self.fc1(x)))
         
-        BIAS = 1.5
-        proposal[:, :2] = proposal[:, :2] - BIAS
+        proposal[:, :2] = proposal[:, :2]
     
         return proposal
 
@@ -605,6 +640,9 @@ class SQAIR(nn.Module):
         self.embedding = Embedding()
         self.proposal_embedding = ProposalEmbedding()
         
+        # Glimpse mask
+        self.glimpse_mask = GlimpseMask()
+        
         
         # Per-batch current highest id. Shape (B, 1). Initialized later.
         self.highest_id = None
@@ -635,6 +673,10 @@ class SQAIR(nn.Module):
         vis_logger['z_pres_prob'] = []
         vis_logger['z_where'] = []
         vis_logger['id'] = []
+        vis_logger['object_enc'] = []
+        vis_logger['object_dec'] = []
+        vis_logger['mask'] = []
+        vis_logger['proposal'] = []
         vis_logger['imgs'] = []
         
         # Append T*K items
@@ -735,19 +777,17 @@ class SQAIR(nn.Module):
         
         # Compute proposal region to look at
         # (B, 4)
-        # proposal_region_delta = self.propagate_proposal(h_tem)
-        # proposal_region = prev_temporal.object.z_where + proposal_region_delta
+        proposal_region_delta = self.propagate_proposal(h_tem)
+        proposal_region = prev_temporal.object.z_where + proposal_region_delta
         # self.i += 1
         # if self.i % 1000 == 0:
         #     print(proposal_region[0])
-        # proposal = self.image_to_glimpse(x, proposal_region, inverse=True)
-        # proposal_embed = self.proposal_embedding(proposal)
+        proposal = self.image_to_glimpse(x, proposal_region, inverse=True)
+        proposal_embed = self.proposal_embedding(proposal)
         
         # (B, N)
         # Predict where and pres, using h^T, h^T and x
-        predict_input = torch.cat((h_rel, h_tem, x_embed), dim=-1)
-        if DEBUG:
-            predict_input = torch.cat((torch.zeros_like(h_rel), h_tem, x_embed), dim=-1)
+        predict_input = torch.cat((h_rel, h_tem, proposal_embed), dim=-1)
         # (B, 4), (B, 4), (B, 1)
         # Note we only predict delta here.
         z_where_delta_loc, z_where_delta_scale, z_pres_prob = self.propagate_predict(predict_input)
@@ -770,11 +810,12 @@ class SQAIR(nn.Module):
         
         # Extract glimpse from x, shape (B, 1, H, W)
         glimpse = self.image_to_glimpse(x, z_where, inverse=True)
+        # This is important for handling overlap
+        glimpse_mask = self.glimpse_mask(h_tem)
+        glimpse = glimpse * glimpse_mask
         
         # Compute postribution over z_what and sample
         z_what_delta_loc, z_what_delta_scale = self.propagate_encoder(glimpse, h_tem, h_rel)
-        if DEBUG:
-            z_what_delta_loc, z_what_delta_scale = self.propagate_encoder(glimpse, h_tem, torch.zeros_like(h_rel))
         z_what_delta_post = Normal(z_what_delta_loc, z_what_delta_scale)
         # (B, N)
         z_what_delta = z_what_delta_post.rsample()
@@ -792,6 +833,13 @@ class SQAIR(nn.Module):
             z_where_delta_scale_prior, z_pres_prob_prior) = (
             self.propagate_prior(h_tem))
         
+        # TODO: demand that scale to be small to guarantee consistency
+        if DEBUG:
+            z_what_delta_loc_prior = arch.z_what_delta_loc_prior.expand_as(z_what_delta_loc_prior)
+            z_what_delta_scale_prior = arch.z_what_delta_scale_prior.expand_as(z_what_delta_scale_prior)
+            z_where_delta_scale_prior = arch.z_where_delta_scale_prior.expand_as(z_where_delta_scale_prior)
+
+
         # Construct prior distributions
         z_what_delta_prior = Normal(z_what_delta_loc_prior, z_what_delta_scale_prior)
         z_where_delta_prior = Normal(z_where_delta_loc_prior, z_where_delta_scale_prior)
@@ -833,8 +881,9 @@ class SQAIR(nn.Module):
         # zero
         id = prev_temporal.object.id * z_pres
         
+        B = x.size(0)
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what, id, z_pres_prob=z_pres_prob)
+        object_state = ObjectState(z_pres, z_where, z_what, id, z_pres_prob=z_pres_prob, object_enc=glimpse.view(B, -1), mask=glimpse_mask.view(B, -1), proposal=proposal_region)
         temporal_state = TemporalState(object_state, h_tem, c_tem)
         relation_state = RelationState(object_state, h_rel, c_rel)
         
@@ -941,12 +990,12 @@ class SQAIR(nn.Module):
         self.highest_id += z_pres
         id = self.highest_id * z_pres
 
+        B = x.size(0)
         # Collect terms into new states.
-        object_state = ObjectState(z_pres, z_where, z_what, id=id, z_pres_prob=z_pres_prob)
+        object_state = ObjectState(z_pres, z_where, z_what, id=id, z_pres_prob=z_pres_prob, object_enc=glimpse.view(B, -1), mask=torch.zeros_like(glimpse.view(B, -1)), proposal=torch.zeros_like(z_where))
         
         # For temporal and prior state, we will use the initial state.
         
-        B = x.size(0)
         temporal_state = TemporalState.get_initial_state(B, object_state)
         relation_state = RelationState(object_state, h_rel, c_rel)
 
@@ -967,7 +1016,7 @@ class SQAIR(nn.Module):
         # TemporalState has six fields, z_where, z_what, z_pres, id. First,
         # concatenate these into a large tensor
         z = defaultdict(list)
-        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob']:
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob', 'object_enc', 'mask', 'proposal']:
             for state in temporal_states:
                 z[key].append(state[key])
             # K * (B, N) ->  (B, K, N)
@@ -985,7 +1034,7 @@ class SQAIR(nn.Module):
         #       output[i, j, k] = in[i, indices[i, j, k], k]
         # we can implement this as torch.gather.
         
-        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob']:
+        for key in ['z_where', 'z_what', 'z_pres', 'id', 'h', 'c', 'z_pres_prob', 'object_enc', 'mask', 'proposal']:
             # Note we need to expand (B, K, 1) to (B, K, N) for each key
             z[key] = torch.gather(z[key], dim=1, index=indices.expand_as(z[key]))
         
@@ -1000,6 +1049,9 @@ class SQAIR(nn.Module):
                 z_pres=z['z_pres'][:, k],
                 id=z['id'][:, k],
                 z_pres_prob=z['z_pres_prob'][:, k],
+                object_enc=z['object_enc'][:, k],
+                mask=z['mask'][:, k],
+                proposal=z['proposal'][:, k],
             )
             new_h = z['h'][:, k]
             new_c = z['c'][:, k]
@@ -1028,7 +1080,11 @@ class SQAIR(nn.Module):
         vis_logger['z_pres_cur'] = []
         vis_logger['z_where_cur'] = []
         vis_logger['z_pres_prob_cur'] = []
+        vis_logger['object_enc_cur'] = []
+        vis_logger['object_dec_cur'] = []
         vis_logger['id_cur'] = []
+        vis_logger['mask_cur'] = []
+        vis_logger['proposal_cur'] = []
         
         for obj in object_list:
             # Decode to (B, 1, H, W)
@@ -1051,12 +1107,22 @@ class SQAIR(nn.Module):
             vis_logger['z_where_cur'].append(obj.z_where[0])
             # Scalar
             vis_logger['id_cur'].append(obj.id[0][0])
-
+            # (H, W)
+            vis_logger['object_enc_cur'].append(obj.object_enc[0].view(*arch.glimpse_shape))
+            # (H, W)
+            vis_logger['object_dec_cur'].append(glimpse[0][0])
+            vis_logger['mask_cur'].append(obj.mask[0].view(*arch.glimpse_shape))
+            vis_logger['proposal_cur'].append(obj.proposal[0])
+            
         vis_logger['canvas'].append(vis_logger['canvas_cur'])
         vis_logger['z_pres'].append(vis_logger['z_pres_cur'])
         vis_logger['z_pres_prob'].append(vis_logger['z_pres_prob_cur'])
         vis_logger['z_where'].append(vis_logger['z_where_cur'])
         vis_logger['id'].append(vis_logger['id_cur'])
+        vis_logger['object_enc'].append(vis_logger['object_enc_cur'])
+        vis_logger['object_dec'].append(vis_logger['object_dec_cur'])
+        vis_logger['mask'].append(vis_logger['mask_cur'])
+        vis_logger['proposal'].append(vis_logger['proposal_cur'])
         
         # Construct output distribution
         output_dist = Normal(canvas, arch.x_scale.expand(canvas.size()))

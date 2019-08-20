@@ -44,6 +44,8 @@ class VisLogger:
         vis_logger['z_pres_prob'].append(vis_logger['z_pres_prob_cur'])
         vis_logger['z_where'].append(vis_logger['z_where_cur'])
         vis_logger['id'].append(vis_logger['id_cur'])
+        object_enc: list of list, each (H*W)
+        object_dec: list of list, each (H*W)
         'imgs'
         
         kl_z_pres_list: list of scalars
@@ -81,17 +83,21 @@ class VisLogger:
         z_pres_prob = [[x.detach().cpu().item() for x in y] for y in self.things['z_pres_prob']]
         id = [[x.detach().cpu().item() for x in y] for y in self.things['id']]
         z_where = [[x.detach().cpu().numpy() for x in y] for y in self.things['z_where']]
+        proposal = [[x.detach().cpu().numpy() for x in y] for y in self.things['proposal']]
+        object_enc = [[x.detach().cpu().numpy() for x in y] for y in self.things['object_enc']]
+        object_dec = [[x.detach().cpu().numpy() for x in y] for y in self.things['object_dec']]
+        mask = [[x.detach().cpu().numpy() for x in y] for y in self.things['mask']]
         
         # image = self.things['image']
         # writer.add_image('vis/original', image.detach(), global_step)
-        fig = create_fig(imgs, canvas, z_pres, z_pres_prob, z_where, id)
+        fig = create_fig(imgs, canvas, z_pres, z_pres_prob, z_where, id, object_enc, object_dec, mask, proposal)
         fig.show()
         # fig.show()
         # writer.add_scalar('train', global_step, global_step)
         writer.add_figure('vis/reconstruct', fig, global_step)
         plt.close(fig)
         
-def create_fig(imgs, canvas, z_pres, z_prob, z_where, id):
+def create_fig(imgs, canvas, z_pres, z_prob, z_where, id, object_enc, object_dec, mask, proposal):
     """
     Args:
         imgs: a list of T images. Each being (H, W)
@@ -107,15 +113,20 @@ def create_fig(imgs, canvas, z_pres, z_prob, z_where, id):
     """
     T = len(imgs)
     K = len(canvas[0])
+    
+    W = (5 * K)
+    H = T
 
     size = 2
-    fig = plt.figure(figsize=(2 * K * size, T * size))
+    fig = plt.figure(figsize=(W * size, H * size))
     # There will be (T, 2K) subplots
+    
+    
     for t in range(T):
     
         # Original
         for i in range(3):
-            ax = fig.add_subplot(T, 2*K, 2*K * t + i + 1)
+            ax = fig.add_subplot(H, W, W * t + i + 1)
             ax.set_axis_off()
             
             ax.imshow(imgs[t], cmap='gray', vmin=0.0, vmax=1.0)
@@ -124,13 +135,35 @@ def create_fig(imgs, canvas, z_pres, z_prob, z_where, id):
         
         # Canvas
         for i in range(3):
-            ax = fig.add_subplot(T, 2*K, 2*K * t + i + 4)
+            ax = fig.add_subplot(H, W, W * t + i + 4)
             ax.set_title('pres: {:.0f}, p: {:.2f}'.format(z_pres[t][i], z_prob[t][i] if i == 0 or z_pres[t][i-1] == 1 else 0))
             ax.set_axis_off()
             ax.imshow(canvas[t][i], cmap='gray', vmin=0.0, vmax=1.0)
             if z_pres[t][i] == 1:
                 draw_bounding_box(ax, z_where[t][i], (50, 50), colors[int(id[t][i])])
+
+        # Encoded
+        for i in range(3):
+            ax = fig.add_subplot(H, W, W * t + i + 7)
+            ax.set_title('pres: {:.0f}, p: {:.2f}'.format(z_pres[t][i], z_prob[t][i] if i == 0 or z_pres[t][i-1] == 1 else 0))
+            ax.set_axis_off()
+            ax.imshow(object_enc[t][i] * z_pres[t][i], cmap='gray', vmin=0.0, vmax=1.0)
+            
+        # Decoded
+        for i in range(3):
+            ax = fig.add_subplot(H, W, W * t + i + 10)
+            ax.set_title('pres: {:.0f}, p: {:.2f}'.format(z_pres[t][i], z_prob[t][i] if i == 0 or z_pres[t][i-1] == 1 else 0))
+            ax.set_axis_off()
+            ax.imshow(object_dec[t][i] * z_pres[t][i], cmap='gray', vmin=0.0, vmax=1.0)
+
         
+        for i in range(3):
+            ax = fig.add_subplot(H, W, W * t + i+ 13)
+            ax.set_axis_off()
+            ax.imshow(imgs[t], cmap='gray', vmin=0.0, vmax=1.0)
+            if z_pres[t][i] == 1:
+                draw_bounding_box(ax, proposal[t][i], (50, 50), colors[int(id[t][i])])
+            
     return fig
     
 
@@ -273,30 +306,49 @@ class WeightScheduler:
         self.interval = interval
         self.model = model
         self.device = device
-        self.current_step = 0
-        self.current = initial
         
         self.start = False
     
     
-    def step(self):
-        self.current_step += 1
-        if not self.start:
-            if self.current_step < self.startsfrom:
-                return
-            else:
-                self.start = True
-                self.current_step = 0
-        
-        if self.current_step > self.total_steps:
-            return
-        
-        if self.current_step % self.interval == 0:
-            ratio = self.current_step / self.total_steps
+    def step(self, global_step):
+        if global_step < self.startsfrom:
+            self.model.reinforce_weight = self.initial
+        elif global_step > self.startsfrom + self.total_steps:
+            self.model.reinforce_weight = self.final
+            
+        else:
+            ratio = (global_step - self.startsfrom) / self.total_steps
             weight = self.initial + ratio * (self.final - self.initial)
             self.model.reinforce_weight = weight
-            self.current = weight
             
+class LRScheduler:
+    def __init__(self, lrs, milestones, optimizer):
+        """
+        Args:
+            lrs: len(lrs) == len(milestones) + 1
+            milestones:
+        """
+        self.lrs = lrs
+        self.milestones = milestones
+        self.optimizer = optimizer
+    
+    def step(self, global_step):
+        # schedule is a list. So we will first determine which region current
+        # step is in.
+        i = 0
+        while True:
+            if i < len(self.milestones) and global_step > self.milestones[i]:
+                i += 1
+            else:
+                break
+                
+        self.optimizer.param_groups[0]['lr'] = self.lrs[i]
+                
+        
+        
+        
+        
+    
         
 
 vis_logger = VisLogger()
